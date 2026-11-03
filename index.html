@@ -613,7 +613,9 @@ const CONFIG = {
     const g = v => v ? '&gid=' + v : '';
     return [
       { name: 'CSV export',  url: gid => `${base}/export?format=csv${g(gid)}` },
-      { name: 'gviz CSV',    url: gid => `${base}/gviz/tq?tqx=out:csv&headers=1${g(gid)}` }
+      { name: 'gviz CSV',    url: gid => `${base}/gviz/tq?tqx=out:csv&headers=1${g(gid)}` },
+      { tab: true, name: 'gviz «Extracto 1»',       url: () => `${base}/gviz/tq?tqx=out:csv&headers=1&sheet=${encodeURIComponent('Extracto 1')}` },
+      { tab: true, name: 'gviz «Hoja vinculada 1»', url: () => `${base}/gviz/tq?tqx=out:csv&headers=1&sheet=${encodeURIComponent('Hoja vinculada 1')}` }
     ];
   })(),
   // ID de pregunta (cabecera de la hoja Samplia) → atributo del informe.
@@ -625,7 +627,10 @@ const CONFIG = {
   // Solo se leen las columnas A a I de la hoja (de «Marca temporal» a «Sentimiento»)
   maxCols: 9,
   // Personas que dicen no haber recibido o probado el producto: sus respuestas no valoran el producto y se excluyen del informe
-  notReceived: /no me (lo |mo )?(han )?(dado|dieron|entregaron)|no (lo )?(he |han )?recibido|no lo he probado|no he recibido este producto para probar|no puedo valorar el producto|no lo he probado|no me lo han entregado|no he recibido el producto/i,
+  // null = no se excluye ninguna fila (se muestran todas las filas de la hoja).
+  // Para volver a excluir a quien no recibió el producto, sustituye null por esta expresión (la que había antes):
+  //   /no me (lo |mo )?(han )?(dado|dieron|entregaron)|no (lo )?(he |han )?recibido|no lo he probado|no he recibido este producto para probar|no puedo valorar el producto|no lo he probado|no me lo han entregado|no he recibido el producto/i
+  notReceived: null,
   // Hoja de respuestas de Google Forms: las cabeceras son el texto de la pregunta, no un question_id
   attrs: [
     { k: 'glob', label: 'Valoración global',        short: 'Valoración global', art: 'La valoración global',      rx: /valoraci[oó]n global/i, q: '¿Cuál es tu valoración global de este producto?' },
@@ -803,7 +808,7 @@ function buildRows(matrix) {
     const g = norm(get('gen')); o.gen = /^(f|mujer)/.test(g) ? 'Mujer' : /^(m|hombre)/.test(g) ? 'Hombre' : null;
     const age = parseInt(get('age'), 10);
     o.ageB = isNaN(age) ? null : (CONFIG.ageBands.find(([, lo, hi]) => age >= lo && age <= hi) || [null])[0];
-    if (CONFIG.attrs.some(a => o[a.k] != null) || o.compra) rows.push(o);
+    if (CONFIG.attrs.some(a => o[a.k] != null) || o.compra || o.porque) rows.push(o);   // cuenta toda fila que conteste algo; las filas sin ninguna respuesta no
   });
   if (!rows.length) throw new Error('No hay respuestas válidas');
   return rows;
@@ -829,36 +834,23 @@ async function loadData() {
   setStatus('', 'Cargando datos…');
   const errors = [];
   if (['http:', 'https:', 'file:'].includes(location.protocol)) {
-    const requests = CONFIG.sources.map(src => {
+    const attempt = list => Promise.all(list.map(async src => {
       const url = src.url(CONFIG.gid);
-      const request = { controller: new AbortController() };
-      const promise = fetchText(url, 9000, request.controller)
-        .then(txt => ({ request, src, url, txt }), error => ({ request, src, url, error }));
-      request.promise = promise;
-      return request;
-    });
-    const pending = new Set(requests.map(request => request.promise));
-    while (pending.size) {
-      const result = await Promise.race(pending);
-      pending.delete(result.request.promise);
-      if (result.error) {
-        errors.push(result.src.name + ': ' + result.error.message);
-        console.warn('[datos] ' + result.src.name + ' falló (' + result.url + '):', result.error.message);
-        continue;
-      }
-      const previousExcluded = state.excluded, previousTotalRows = state.totalRows;
-      const previousHeaders = state.headers;
       try {
-        const rows = buildRows(toMatrix(result.txt));
-        state.rows = rows; state.source = 'live'; state.liveErrors = [];
-        requests.forEach(request => request.controller.abort());
-        setStatus('live', `Datos en vivo de la hoja (${state.rows.length} respuestas${exNote()})`);
-        return;
-      } catch (error) {
-        state.excluded = previousExcluded; state.totalRows = previousTotalRows; state.headers = previousHeaders;
-        errors.push(result.src.name + ': ' + error.message);
-        console.warn('[datos] ' + result.src.name + ' devolvió datos no válidos (' + result.url + '):', error.message);
-      }
+        const rows = buildRows(toMatrix(await fetchText(url)));
+        return { src, rows, excluded: state.excluded, totalRows: state.totalRows, headers: state.headers };
+      } catch (e) { errors.push(src.name + ': ' + e.message); console.warn('[datos] ' + src.name + ' falló (' + url + '):', e.message); return null; }
+    }));
+    const pick = tries => tries.filter(Boolean).sort((a, b) => b.rows.length - a.rows.length || (b.totalRows || 0) - (a.totalRows || 0))[0];
+    // Manda la pestaña de datos por defecto (export / gviz). Las pestañas con nombre solo se usan si ninguna de esas URL responde:
+    // elegir «la que más filas trae» podía acabar leyendo otra pestaña (Extracto / Hoja vinculada) y mostrar más filas que la hoja de datos.
+    let best = pick(await attempt(CONFIG.sources.filter(s => !s.tab)));
+    if (!best) best = pick(await attempt(CONFIG.sources.filter(s => s.tab)));
+    if (best) {
+      Object.assign(state, { rows: best.rows, excluded: best.excluded, totalRows: best.totalRows, headers: best.headers, source: 'live', liveErrors: [] });
+      console.info('[datos] Fuente usada: ' + best.src.name + ' (' + best.rows.length + ' respuestas)');
+      setStatus('live', `Datos en vivo de la hoja (${state.rows.length} respuestas${exNote()})`);
+      return;
     }
   } else errors.push('protocolo ' + location.protocol + ' sin acceso a la red');
   state.liveErrors = errors;
